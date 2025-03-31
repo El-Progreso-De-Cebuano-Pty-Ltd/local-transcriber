@@ -1,10 +1,12 @@
 import React, { useState, useEffect } from "react";
 import styled from "styled-components";
+import * as antd from "antd";  // Import all antd components
+import { SaveOutlined, FileTextOutlined } from "@ant-design/icons";
 
 import { createModel, KaldiRecognizer, Model } from "vosk-browser";
-import FileUpload from "./file-upload";
 import Microphone from "./microphone";
-import ModelLoader from "./model-loader";
+
+const { Button, Modal, Input, Spin } = antd;  // Destructure the components
 
 const Wrapper = styled.div`
   width: 80%;
@@ -39,6 +41,19 @@ const Word = styled.span<{ confidence: number }>`
   white-space: normal;
 `;
 
+// For saving to a file
+const downloadTextAsFile = (text: string, filename: string) => {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+};
+
 interface VoskResult {
   result: Array<{
     conf: number;
@@ -59,6 +74,11 @@ export const Recognizer: React.FunctionComponent = () => {
   const [recognizer, setRecognizer] = useState<KaldiRecognizer>();
   const [loading, setLoading] = useState(false);
   const [ready, setReady] = useState(false);
+  const [fileName, setFileName] = useState("transcription");
+  const [saveModalVisible, setSaveModalVisible] = useState(false);
+  const [summarizing, setSummarizing] = useState(false);
+  const [summaryModalVisible, setSummaryModalVisible] = useState(false);
+  const [summary, setSummary] = useState("");
 
   const loadModel = async (path: string) => {
     setLoading(true);
@@ -89,24 +109,123 @@ export const Recognizer: React.FunctionComponent = () => {
 
   // Auto-load English model on component mount
   useEffect(() => {
-    // English model path from model-loader.tsx
+    // English model path
     const englishModelPath = "vosk-model-small-en-us-0.15.tar.gz";
     loadModel(englishModelPath);
   }, []);
 
+  // Get all text from utterances
+  const getFullTranscript = () => {
+    if (!utterances || utterances.length === 0) {
+      return "";
+    }
+    
+    return utterances
+      .map((utt) => {
+        if (!utt || !utt.result || !Array.isArray(utt.result)) {
+          return "";
+        }
+        return utt.result
+          .map((word) => word?.word || "")
+          .filter(Boolean)
+          .join(" ");
+      })
+      .filter(Boolean)
+      .join(" ");
+  };
+
+  // Save transcript to a file
+  const handleSave = () => {
+    try {
+      const transcript = getFullTranscript();
+      if (transcript && transcript.trim()) {
+        downloadTextAsFile(transcript, `${fileName}.txt`);
+        setSaveModalVisible(false);
+      } else {
+        console.warn("No transcript content to save");
+      }
+    } catch (error) {
+      console.error("Error saving transcript:", error);
+    }
+  };
+
+  // Generate a summary using API
+  const generateSummary = async () => {
+    try {
+      setSummarizing(true);
+      const transcript = getFullTranscript();
+      
+      if (!transcript || !transcript.trim()) {
+        setSummary("No transcript content to summarize.");
+        setSummarizing(false);
+        return;
+      }
+      
+      // You will need to provide your API key and endpoint
+      const apiEndpoint = "https://api.openai.com/v1/chat/completions";
+      const apiKey = "YOUR_API_KEY"; // Replace with your actual API key or use environment variable
+      
+      const response = await fetch(apiEndpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model: "gpt-3.5-turbo",
+          messages: [
+            {
+              role: "system",
+              content: "You are a helpful assistant that summarizes text concisely."
+            },
+            {
+              role: "user",
+              content: `Please summarize the following transcript in 2-3 sentences: ${transcript}`
+            }
+          ],
+          max_tokens: 150
+        })
+      });
+      
+      const data = await response.json();
+      
+      if (data.choices && data.choices.length > 0) {
+        setSummary(data.choices[0].message.content.trim());
+      } else {
+        setSummary("Failed to generate summary. Please try again.");
+      }
+    } catch (error) {
+      console.error("Error generating summary:", error);
+      setSummary("An error occurred while generating the summary.");
+    } finally {
+      setSummarizing(false);
+    }
+  };
+
   return (
     <Wrapper>
-      <ModelLoader
-        onModelChange={(path) => setReady(loadedModel?.path === path)}
-        onModelSelect={(path) => {
-          if (loadedModel?.path !== path) {
-            loadModel(path);
-          }
-        }}
-        loading={loading}
-      />
+      {loading && <div style={{ textAlign: 'center', margin: '1rem 0' }}>Loading English model...</div>}
       <Header>
         <Microphone recognizer={recognizer} loading={loading} ready={ready} />
+        <Button 
+          icon={<SaveOutlined />} 
+          style={{ marginLeft: '10px' }}
+          disabled={!utterances.length}
+          onClick={() => setSaveModalVisible(true)}
+        >
+          Save
+        </Button>
+        <Button 
+          icon={<FileTextOutlined />} 
+          style={{ marginLeft: '10px' }}
+          disabled={!utterances.length}
+          onClick={() => {
+            setSummaryModalVisible(true);
+            generateSummary();
+          }}
+        >
+          Summarize
+        </Button>
       </Header>
       <ResultContainer>
         {utterances.map((utt, uindex) =>
@@ -122,6 +241,47 @@ export const Recognizer: React.FunctionComponent = () => {
         )}
         <span key="partial">{partial}</span>
       </ResultContainer>
+
+      {/* Save Modal */}
+      <Modal
+        title="Save Transcript"
+        open={saveModalVisible}
+        onOk={handleSave}
+        onCancel={() => setSaveModalVisible(false)}
+      >
+        <p>Enter a name for your transcript file:</p>
+        <Input
+          value={fileName}
+          onChange={(e) => setFileName(e.target.value)}
+          placeholder="transcript"
+          suffix=".txt"
+        />
+      </Modal>
+
+      {/* Summary Modal */}
+      <Modal
+        title="Transcript Summary"
+        open={summaryModalVisible}
+        onOk={() => setSummaryModalVisible(false)}
+        onCancel={() => setSummaryModalVisible(false)}
+        footer={[
+          <Button key="close" onClick={() => setSummaryModalVisible(false)}>
+            Close
+          </Button>
+        ]}
+      >
+        {summarizing ? (
+          <div style={{ textAlign: 'center', padding: '20px' }}>
+            <Spin size="large" />
+            <p style={{ marginTop: '10px' }}>Generating summary...</p>
+          </div>
+        ) : (
+          <div>
+            <p><strong>Summary:</strong></p>
+            <p>{summary}</p>
+          </div>
+        )}
+      </Modal>
     </Wrapper>
   );
 };
