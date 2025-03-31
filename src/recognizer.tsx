@@ -2,11 +2,17 @@ import React, { useState, useEffect } from "react";
 import styled from "styled-components";
 import * as antd from "antd";  // Import all antd components
 import { SaveOutlined, FileTextOutlined } from "@ant-design/icons";
+// Import only what we need from transformers
+import { env, pipeline, TextClassificationPipeline } from '@xenova/transformers';
 
 import { createModel, KaldiRecognizer, Model } from "vosk-browser";
 import Microphone from "./microphone";
 
 const { Button, Modal, Input, Spin } = antd;  // Destructure the components
+
+// Configure transformers.js to use smaller/faster models
+env.allowLocalModels = false;  // Disallow local models to avoid confusion
+env.useBrowserCache = true;   // Enable caching for faster subsequent loads
 
 const Wrapper = styled.div`
   width: 80%;
@@ -79,7 +85,11 @@ export const Recognizer: React.FunctionComponent = () => {
   const [summarizing, setSummarizing] = useState(false);
   const [summaryModalVisible, setSummaryModalVisible] = useState(false);
   const [summary, setSummary] = useState("");
+  const [llmStatus, setLlmStatus] = useState("");
+  const [textClassifier, setTextClassifier] = useState<TextClassificationPipeline | null>(null);
+  const [llmLoading, setLlmLoading] = useState(false);
 
+  // Load the speech recognition model
   const loadModel = async (path: string) => {
     setLoading(true);
     loadedModel?.model.terminate();
@@ -113,6 +123,32 @@ export const Recognizer: React.FunctionComponent = () => {
     const englishModelPath = "vosk-model-small-en-us-0.15.tar.gz";
     loadModel(englishModelPath);
   }, []);
+
+  // Lazy-load the text classification model only when needed
+  const loadTextClassifier = async () => {
+    if (textClassifier) return textClassifier;
+    
+    setLlmLoading(true);
+    setLlmStatus("Loading text analysis model...");
+    
+    try {
+      // Use a tiny sentiment analysis model - much smaller and faster than summarization models
+      const classifier = await pipeline(
+        'sentiment-analysis',
+        'Xenova/distilbert-base-uncased-finetuned-sst-2-english'
+      );
+      
+      setTextClassifier(classifier);
+      setLlmStatus("Text analysis model loaded");
+      setLlmLoading(false);
+      return classifier;
+    } catch (error) {
+      console.error("Error loading text classifier:", error);
+      setLlmStatus("Failed to load text analysis model");
+      setLlmLoading(false);
+      return null;
+    }
+  };
 
   // Get all text from utterances
   const getFullTranscript = () => {
@@ -149,50 +185,113 @@ export const Recognizer: React.FunctionComponent = () => {
     }
   };
 
-  // Generate a summary using API
+  // Break text into sentences
+  const getSentences = (text: string): string[] => {
+    return text
+      .replace(/([.?!])\s*(?=[A-Z])/g, "$1|")
+      .split("|")
+      .map((s: string) => s.trim())
+      .filter((s: string) => s.length > 5);
+  };
+
+  // Get the most important sentences
+  const getImportantSentences = (sentences: string[], count = 3): string[] => {
+    if (sentences.length <= count) return sentences;
+    
+    // Simple heuristic - get first, middle and last sentence
+    const result = [sentences[0]];
+    
+    if (count >= 2) {
+      result.push(sentences[Math.floor(sentences.length / 2)]);
+    }
+    
+    if (count >= 3) {
+      result.push(sentences[sentences.length - 1]);
+    }
+    
+    return result;
+  };
+
+  // Explicitly define types for our sentiment analysis results
+  interface SentimentResult {
+    sentence: string;
+    score: number;
+    sentiment: string;
+  }
+
+  // Generate a summary
   const generateSummary = async () => {
+    setSummarizing(true);
     try {
-      setSummarizing(true);
       const transcript = getFullTranscript();
       
       if (!transcript || !transcript.trim()) {
         setSummary("No transcript content to summarize.");
-        setSummarizing(false);
         return;
       }
       
-      // You will need to provide your API key and endpoint
-      const apiEndpoint = "https://api.openai.com/v1/chat/completions";
-      const apiKey = "YOUR_API_KEY"; // Replace with your actual API key or use environment variable
+      // Break into sentences
+      const sentences = getSentences(transcript);
       
-      const response = await fetch(apiEndpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: "gpt-3.5-turbo",
-          messages: [
-            {
-              role: "system",
-              content: "You are a helpful assistant that summarizes text concisely."
-            },
-            {
-              role: "user",
-              content: `Please summarize the following transcript in 2-3 sentences: ${transcript}`
-            }
-          ],
-          max_tokens: 150
-        })
-      });
+      if (sentences.length === 0) {
+        setSummary("The transcript is too short to summarize effectively.");
+        return;
+      }
       
-      const data = await response.json();
+      if (sentences.length <= 3) {
+        setSummary(transcript);
+        return;
+      }
       
-      if (data.choices && data.choices.length > 0) {
-        setSummary(data.choices[0].message.content.trim());
-      } else {
-        setSummary("Failed to generate summary. Please try again.");
+      try {
+        // Load the classifier if not already loaded
+        const classifier = await loadTextClassifier();
+        
+        if (classifier) {
+          // Use sentiment analysis to enhance our extractive summary
+          const results = await Promise.all(
+            sentences.map(async (sentence: string): Promise<SentimentResult> => {
+              try {
+                const sentiment = await classifier(sentence);
+                // Handle different output formats from different models
+                const result = sentiment[0];
+                // Access properties safely with optional chaining
+                return { 
+                  sentence, 
+                  score: (result as any)?.score || (result as any)?.confidence || 0.5,
+                  sentiment: (result as any)?.label || 'NEUTRAL'
+                };
+              } catch (e) {
+                return { sentence, score: 0.5, sentiment: 'NEUTRAL' };
+              }
+            })
+          );
+          
+          // Find sentences with strongest sentiment (most interesting)
+          const sortedResults = [...results].sort((a, b) => b.score - a.score);
+          const topSentences = sortedResults.slice(0, 3).map(r => r.sentence);
+          
+          // Make sure to include the first sentence for context
+          if (!topSentences.includes(sentences[0])) {
+            topSentences[topSentences.length - 1] = sentences[0];
+          }
+          
+          // Sort back into document order
+          const orderedSentences = topSentences.sort((a, b) => 
+            sentences.indexOf(a) - sentences.indexOf(b)
+          );
+          
+          setSummary(orderedSentences.join(" "));
+        } else {
+          // Fallback to simple extractive summarization
+          const importantSentences = getImportantSentences(sentences);
+          setSummary(importantSentences.join(" "));
+        }
+      } catch (error) {
+        console.error("Error in sentiment analysis:", error);
+        // Fallback to simple extractive summarization
+        const importantSentences = getImportantSentences(sentences);
+        setSummary(importantSentences.join(" "));
       }
     } catch (error) {
       console.error("Error generating summary:", error);
@@ -205,6 +304,7 @@ export const Recognizer: React.FunctionComponent = () => {
   return (
     <Wrapper>
       {loading && <div style={{ textAlign: 'center', margin: '1rem 0' }}>Loading English model...</div>}
+      {llmLoading && <div style={{ textAlign: 'center', margin: '0.5rem 0', fontSize: '12px', color: '#666' }}>{llmStatus}</div>}
       <Header>
         <Microphone recognizer={recognizer} loading={loading} ready={ready} />
         <Button 
@@ -274,6 +374,7 @@ export const Recognizer: React.FunctionComponent = () => {
           <div style={{ textAlign: 'center', padding: '20px' }}>
             <Spin size="large" />
             <p style={{ marginTop: '10px' }}>Generating summary...</p>
+            {llmLoading && <p style={{ fontSize: '12px', color: '#666' }}>{llmStatus}</p>}
           </div>
         ) : (
           <div>
