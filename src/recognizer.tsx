@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import styled from "styled-components";
 
 import { createModel, KaldiRecognizer, Model } from "vosk-browser";
@@ -87,6 +87,13 @@ export const Recognizer: React.FunctionComponent = () => {
     });
   };
 
+  // Auto-load English model on component mount
+  useEffect(() => {
+    // English model path from model-loader.tsx
+    const englishModelPath = "vosk-model-small-en-us-0.15.tar.gz";
+    loadModel(englishModelPath);
+  }, []);
+
   return (
     <Wrapper>
       <ModelLoader
@@ -100,7 +107,6 @@ export const Recognizer: React.FunctionComponent = () => {
       />
       <Header>
         <Microphone recognizer={recognizer} loading={loading} ready={ready} />
-        <FileUpload recognizer={recognizer} loading={loading} ready={ready} />
       </Header>
       <ResultContainer>
         {utterances.map((utt, uindex) =>
